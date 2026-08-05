@@ -28,13 +28,6 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 启动 RSSHub
-        run: |
-          docker run -d --name rsshub -p 1200:1200 diygod/rsshub:latest
-          echo "等待 RSSHub 启动..."
-          timeout 90 bash -c 'until curl -sf http://localhost:1200/ > /dev/null 2>&1; do echo "  RSSHub 还在启动中..."; sleep 3; done'
-          echo "RSSHub 已就绪!"
-
       - name: 抓取微博博文
         run: |
           export TZ=Asia/Shanghai
