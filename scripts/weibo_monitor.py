@@ -79,34 +79,61 @@ def get_existing_links(blogger_dir):
     return links
 
 
+def get_visitor_cookie():
+    """Visit m.weibo.cn to get a visitor cookie (_T_WM)."""
+    try:
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        # Visit the main page first to get cookies
+        resp = session.get("https://m.weibo.cn/", timeout=15)
+        cookies = session.cookies.get_dict()
+        if cookies:
+            print(f"  Got visitor cookies: {list(cookies.keys())}")
+        return session
+    except Exception as e:
+        print(f"  ⚠ Failed to get visitor cookie: {e}")
+        return requests.Session()
+
+
 def fetch_weibo_posts(uid):
     """Fetch latest posts from m.weibo.cn API.
 
     Returns a list of dicts with keys: title, link, description, published.
     Returns None on failure.
     """
-    url = f"https://m.weibo.cn/api/container/getIndex"
-    params = {"type": "uid", "value": uid}
+    url = "https://m.weibo.cn/api/container/getIndex"
+
+    # Get a session with visitor cookies
+    session = get_visitor_cookie()
+    session.headers.update(HEADERS)
 
     for attempt in range(3):
         try:
             if attempt > 0:
                 time.sleep(2 ** attempt)
-                # Add a random cookie for retry to bypass rate limiting
-                HEADERS["Cookie"] = f"_T_WM=retry{attempt}"
 
-            resp = requests.get(url, headers=HEADERS, params=params, timeout=30)
+            params = {"type": "uid", "value": uid}
+            resp = session.get(url, params=params, timeout=30)
 
             if resp.status_code != 200:
                 print(f"  ⚠ m.weibo.cn returned HTTP {resp.status_code}")
+                # Try refreshing cookies
+                session = get_visitor_cookie()
+                session.headers.update(HEADERS)
                 continue
 
             data = resp.json()
 
             if data.get("ok") != 1:
                 msg = data.get("msg", "unknown error")
-                print(f"  ⚠ m.weibo.cn API error: {msg}")
-                # HTTP 432 usually means WAF block
+                print(f"  ⚠ m.weibo.cn API error: {msg} (attempt {attempt+1}/3)")
+                # Print response for debugging
+                print(f"  Response keys: {list(data.keys())}")
+                if "data" in data:
+                    print(f"  Data keys: {list(data['data'].keys()) if isinstance(data['data'], dict) else 'not dict'}")
+                # Try refreshing cookies
+                session = get_visitor_cookie()
+                session.headers.update(HEADERS)
                 continue
 
             # Extract posts from cards
