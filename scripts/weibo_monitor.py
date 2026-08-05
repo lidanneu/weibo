@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Weibo Monitor - Fetches latest posts from Weibo bloggers via m.weibo.cn API.
+Weibo Monitor - Fetches latest posts from Weibo bloggers via weibo.com Ajax API.
 Requires WEIBO_COOKIE environment variable (GitHub Actions secret).
-The cookie can be from weibo.com or m.weibo.cn — the script handles SSO cross-domain login.
+Get the cookie from weibo.com (desktop site) Chrome DevTools.
 
 First run: saves the latest 1 post per blogger.
 Subsequent runs: saves only new posts (detected by link comparison).
@@ -40,12 +40,12 @@ BLOGGERS = [
 # Get cookie from environment
 WEIBO_COOKIE = os.environ.get("WEIBO_COOKIE", "")
 
-# Request headers
+# Desktop browser headers for weibo.com
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
-    "Referer": "https://m.weibo.cn/",
-    "MWeibo-Pwa": "1",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Referer": "https://weibo.com/",
     "X-Requested-With": "XMLHttpRequest",
 }
 
@@ -84,138 +84,124 @@ def get_existing_links(blogger_dir):
 
 
 def create_session():
-    """Create a requests session with cookie set for multiple domains."""
+    """Create a requests session with cookie set for weibo.com."""
     session = requests.Session()
     session.headers.update(HEADERS)
 
     if WEIBO_COOKIE:
-        # Parse cookie string and set cookies for multiple domains
+        # Set cookie as header
+        session.headers["Cookie"] = WEIBO_COOKIE
+
+        # Also parse into cookie jar for proper domain handling
         for cookie_pair in WEIBO_COOKIE.split(";"):
             cookie_pair = cookie_pair.strip()
             if "=" in cookie_pair:
                 name, value = cookie_pair.split("=", 1)
-                name = name.strip()
-                value = value.strip()
-                # Set for all weibo-related domains
-                for domain in [".weibo.cn", ".weibo.com", ".sina.com.cn", ".sina.cn"]:
-                    session.cookies.set(name, value, domain=domain)
-
-        # Also set as header for maximum compatibility
-        session.headers["Cookie"] = WEIBO_COOKIE
+                session.cookies.set(name.strip(), value.strip(), domain=".weibo.com")
+                session.cookies.set(name.strip(), value.strip(), domain=".sina.com.cn")
 
     return session
 
 
-def do_sso_login(session):
-    """Perform SSO cross-domain login to get m.weibo.cn cookies from weibo.com cookies."""
-    # Step 1: Visit m.weibo.cn to trigger SSO redirect
-    try:
-        resp = session.get("https://m.weibo.cn/", timeout=15, allow_redirects=False)
-    except Exception as e:
-        print(f"  SSO step 1 failed: {e}")
-        return False
-
-    # Step 2: If redirected to SSO, follow the redirect chain
-    sso_url = None
-    if resp.status_code in (301, 302):
-        sso_url = resp.headers.get("Location", "")
-    else:
-        # Try API call to detect SSO redirect
-        try:
-            api_url = "https://m.weibo.cn/api/config"
-            resp2 = session.get(api_url, timeout=15)
-            if resp2.status_code == 200:
-                data = resp2.json()
-                if data.get("ok") == -100:
-                    sso_url = data.get("url", "")
-        except Exception:
-            pass
-
-    if not sso_url:
-        print("  No SSO redirect detected, cookies may already be valid")
-        return True
-
-    print(f"  SSO login: following redirect...")
-
-    # Follow SSO redirect chain (passport.weibo.com → m.weibo.cn)
-    try:
-        current_url = sso_url
-        for _ in range(5):  # Max 5 redirects
-            if not current_url:
-                break
-            resp = session.get(current_url, timeout=15, allow_redirects=False)
-            if resp.status_code in (301, 302):
-                current_url = resp.headers.get("Location", "")
-                if current_url and not current_url.startswith("http"):
-                    # Relative URL
-                    current_url = "https://m.weibo.cn" + current_url
-            else:
-                break
-        print("  SSO login completed")
-        return True
-    except Exception as e:
-        print(f"  SSO follow failed: {e}")
-        return False
-
-
 def fetch_weibo_posts(uid):
-    """Fetch latest posts from m.weibo.cn API using cookie authentication.
+    """Fetch latest posts from weibo.com Ajax API.
 
     Returns a list of dicts with keys: title, link, description, published.
     Returns None on failure.
     """
     session = create_session()
 
-    # Perform SSO cross-domain login if needed
-    do_sso_login(session)
+    # Step 0: Visit weibo.com to establish session and get any needed tokens
+    try:
+        session.get(f"https://weibo.com/u/{uid}", timeout=15, allow_redirects=True)
+    except Exception:
+        pass
 
-    url = "https://m.weibo.cn/api/container/getIndex"
+    # Try weibo.com Ajax API: profile profilePage
+    url = "https://weibo.com/ajax/statuses/profileProfilePage"
 
     for attempt in range(3):
         try:
             if attempt > 0:
                 time.sleep(3)
-                # Re-do SSO login on retry
-                if attempt == 1:
-                    print("  Retrying with SSO login...")
-                    do_sso_login(session)
 
-            # Step 1: Get the containerid for the user
-            params1 = {"type": "uid", "value": uid}
-            resp1 = session.get(url, params=params1, timeout=30)
+            params = {
+                "uid": uid,
+                "page": 1,
+                "feature": 0,
+            }
 
-            if resp1.status_code != 200:
-                print(f"  ⚠ m.weibo.cn returned HTTP {resp1.status_code}")
-                continue
+            resp = session.get(url, params=params, timeout=30)
 
-            data1 = resp1.json()
-
-            if data1.get("ok") != 1:
-                msg = data1.get("msg", "unknown error")
-                print(f"  ⚠ API error (attempt {attempt+1}/3): {msg}")
-                if "url" in data1:
-                    print(f"  SSO redirect detected, following...")
-                    sso_url = data1["url"]
-                    try:
-                        current_url = sso_url
-                        for _ in range(5):
-                            if not current_url:
-                                break
-                            resp = session.get(current_url, timeout=15, allow_redirects=False)
-                            if resp.status_code in (301, 302):
-                                current_url = resp.headers.get("Location", "")
-                                if current_url and not current_url.startswith("http"):
-                                    current_url = "https://m.weibo.cn" + current_url
-                            else:
-                                break
-                    except Exception:
-                        pass
+            if resp.status_code != 200:
+                print(f"  ⚠ weibo.com returned HTTP {resp.status_code}")
                 if attempt == 2:
-                    print(f"  Response: {json.dumps(data1, ensure_ascii=False)[:300]}")
+                    print(f"  Response: {resp.text[:300]}")
                 continue
 
-            # Extract containerid from tabsInfo
-            tabs_info = data1.get("data", {}).get("tabsInfo", {})
+            data = resp.json()
+
+            # Check for errors
+            if "error" in data or "error_code" in data:
+                err_msg = data.get("error", {}).get("message", "") or data.get("msg", "")
+                print(f"  ⚠ API error (attempt {attempt+1}/3): {err_msg}")
+                if attempt == 2:
+                    print(f"  Response: {json.dumps(data, ensure_ascii=False)[:300]}")
+                continue
+
+            # Extract posts from the response
+            posts = extract_posts_from_weibo_com(data, uid)
+
+            if posts:
+                print(f"  ✓ Got {len(posts)} posts")
+                return posts
+            else:
+                print(f"  ⚠ No posts in response (attempt {attempt+1}/3)")
+                if attempt == 2:
+                    print(f"  Response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+                    print(f"  Response: {json.dumps(data, ensure_ascii=False)[:500]}")
+
+        except requests.exceptions.RequestException as e:
+            print(f"  ⚠ Request failed: {type(e).__name__}: {e}")
+        except json.JSONDecodeError as e:
+            print(f"  ⚠ JSON parse error: {e}")
+            if attempt == 2:
+                print(f"  Response text: {resp.text[:300]}")
+        except Exception as e:
+            print(f"  ⚠ Error: {type(e).__name__}: {e}")
+
+    # Fallback: try m.weibo.cn API
+    print("  Trying m.weibo.cn API as fallback...")
+    return fetch_weibo_posts_m(uid, session)
+
+
+def fetch_weibo_posts_m(uid, session):
+    """Fallback: try m.weibo.cn API."""
+    url = "https://m.weibo.cn/api/container/getIndex"
+    m_headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "Referer": "https://m.weibo.cn/",
+        "MWeibo-Pwa": "1",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+    for attempt in range(2):
+        try:
+            params = {"type": "uid", "value": uid}
+            resp = session.get(url, params=params, headers=m_headers, timeout=30)
+
+            if resp.status_code != 200:
+                print(f"  ⚠ m.weibo.cn returned HTTP {resp.status_code}")
+                continue
+
+            data = resp.json()
+
+            if data.get("ok") != 1:
+                print(f"  ⚠ m.weibo.cn error: {data.get('msg', 'unknown')}")
+                continue
+
+            # Extract containerid and fetch posts
+            tabs_info = data.get("data", {}).get("tabsInfo", {})
             tabs = tabs_info.get("tabs", [])
             container_id = None
             for tab in tabs:
@@ -224,69 +210,115 @@ def fetch_weibo_posts(uid):
                     break
 
             if not container_id:
-                # Fallback: try to get posts directly from the first response
-                posts = extract_posts_from_cards(data1, uid)
+                posts = extract_posts_from_cards(data, uid)
                 if posts:
-                    print(f"  ✓ Got {len(posts)} posts (from profile page)")
+                    print(f"  ✓ Got {len(posts)} posts (m.weibo.cn profile)")
                     return posts
-                print(f"  ⚠ No containerid found")
                 continue
 
-            # Step 2: Fetch posts using the containerid
             params2 = {"type": "uid", "value": uid, "containerid": container_id}
-            resp2 = session.get(url, params=params2, timeout=30)
+            resp2 = session.get(url, params=params2, headers=m_headers, timeout=30)
+            if resp2.status_code == 200:
+                data2 = resp2.json()
+                if data2.get("ok") == 1:
+                    posts = extract_posts_from_cards(data2, uid)
+                    if posts:
+                        print(f"  ✓ Got {len(posts)} posts (m.weibo.cn)")
+                        return posts
 
-            if resp2.status_code != 200:
-                print(f"  ⚠ m.weibo.cn posts API returned HTTP {resp2.status_code}")
-                continue
-
-            data2 = resp2.json()
-
-            if data2.get("ok") != 1:
-                print(f"  ⚠ Posts API error: {data2.get('msg', 'unknown')}")
-                continue
-
-            posts = extract_posts_from_cards(data2, uid)
-
-            if posts:
-                print(f"  ✓ Got {len(posts)} posts")
-                return posts
-            else:
-                print(f"  ⚠ No posts in response")
-                # Try page 2
-                params3 = {"type": "uid", "value": uid, "containerid": container_id, "page": 2}
-                resp3 = session.get(url, params=params3, timeout=30)
-                if resp3.status_code == 200:
-                    data3 = resp3.json()
-                    posts3 = extract_posts_from_cards(data3, uid)
-                    if posts3:
-                        print(f"  ✓ Got {len(posts3)} posts (page 2)")
-                        return posts3
-
-        except requests.exceptions.RequestException as e:
-            print(f"  ⚠ Request failed: {type(e).__name__}: {e}")
-        except json.JSONDecodeError as e:
-            print(f"  ⚠ JSON parse error: {e}")
         except Exception as e:
-            print(f"  ⚠ Error: {type(e).__name__}: {e}")
+            print(f"  ⚠ m.weibo.cn fallback error: {e}")
 
     return None
 
 
+def extract_posts_from_weibo_com(data, uid):
+    """Extract posts from weibo.com Ajax API response."""
+    posts = []
+
+    # weibo.com profileProfilePage response structure
+    list_data = data.get("data", {}).get("list", [])
+    if not list_data:
+        # Try alternate structure
+        list_data = data.get("data", {}).get("statuses", [])
+    if not list_data:
+        list_data = data.get("statuses", [])
+
+    for item in list_data:
+        post = parse_weibo_com_post(item, uid)
+        if post:
+            posts.append(post)
+
+    return posts
+
+
+def parse_weibo_com_post(item, uid):
+    """Parse a weibo.com Ajax API post item."""
+    try:
+        id_str = str(item.get("id", ""))
+        bid = item.get("bid", "")
+
+        if id_str:
+            link = f"https://weibo.com/{uid}/{id_str}"
+        elif bid:
+            link = f"https://weibo.com/{uid}/{bid}"
+        else:
+            return None
+
+        # Get text content
+        raw_text = item.get("text_raw", "") or item.get("text", "")
+        text = strip_html(raw_text) if raw_text else ""
+
+        # Get long text if available
+        if item.get("isLongText"):
+            long_text = item.get("longText", {}).get("longTextContent", "")
+            if long_text:
+                text = strip_html(long_text)
+
+        # Get original post if retweet
+        retweeted = item.get("retweeted_status", {})
+        if retweeted:
+            retweet_text = strip_html(retweeted.get("text_raw", "") or retweeted.get("text", ""))
+            retweet_user = retweeted.get("user", {}).get("screen_name", "")
+            text += f"\n\n🔁 转发 @{retweet_user}:\n{retweet_text}"
+
+        # Get images
+        pics = item.get("pic_ids", [])
+        if pics:
+            text += "\n\n📷 图片:\n" + "\n".join(f"https://wx1.sinaimg.cn/large/{p}" for p in pics)
+        elif item.get("pics"):
+            pic_urls = [p.get("url", p.get("large", {}).get("url", "")) for p in item["pics"]]
+            text += "\n\n📷 图片:\n" + "\n".join(pic_urls)
+
+        # Get created_at
+        created_at = item.get("created_at", "")
+
+        # Title = first 50 chars
+        title = text[:50] + ("..." if len(text) > 50 else "")
+
+        return {
+            "title": title,
+            "link": link,
+            "description": text,
+            "published": created_at,
+        }
+    except Exception as e:
+        print(f"  ⚠ Error parsing post: {e}")
+        return None
+
+
 def extract_posts_from_cards(data, uid):
-    """Extract posts from API response cards."""
+    """Extract posts from m.weibo.cn API response cards."""
     posts = []
     cards = data.get("data", {}).get("cards", [])
 
     for card in cards:
-        # card_type 9 = weibo post
         if card.get("card_type") == 9:
             mblog = card.get("mblog", {})
             if mblog:
                 post = parse_mblog(mblog, uid)
                 if post:
                     posts.append(post)
-        # card_group may contain nested cards
         elif card.get("card_group"):
             for sub_card in card["card_group"]:
                 if sub_card.get("card_type") == 9:
@@ -300,7 +332,7 @@ def extract_posts_from_cards(data, uid):
 
 
 def parse_mblog(mblog, uid):
-    """Parse an mblog object into a post dict."""
+    """Parse an m.weibo.cn mblog object into a post dict."""
     try:
         id_str = mblog.get("id", "")
         bid = mblog.get("bid", "")
@@ -312,33 +344,26 @@ def parse_mblog(mblog, uid):
         else:
             return None
 
-        # Get text content
         raw_text = mblog.get("text", "")
         text = strip_html(raw_text)
 
-        # Get long text if available
         if mblog.get("isLongText"):
             long_text = mblog.get("longText", {}).get("longTextContent", "")
             if long_text:
                 text = strip_html(long_text)
 
-        # Get original post if retweet
         retweeted_status = mblog.get("retweeted_status", {})
         if retweeted_status:
             retweet_text = strip_html(retweeted_status.get("text", ""))
             retweet_user = retweeted_status.get("user", {}).get("screen_name", "")
             text += f"\n\n🔁 转发 @{retweet_user}:\n{retweet_text}"
 
-        # Get images
         pics = mblog.get("pics", [])
         if pics:
             pic_urls = [p.get("large", {}).get("url", p.get("url", "")) for p in pics]
             text += "\n\n📷 图片:\n" + "\n".join(pic_urls)
 
-        # Get created_at
         created_at = mblog.get("created_at", "")
-
-        # Title = first 50 chars
         title = text[:50] + ("..." if len(text) > 50 else "")
 
         return {
@@ -370,11 +395,9 @@ def process_blogger(blogger):
 
     print(f"  Total posts fetched: {len(posts)}")
 
-    # Get all links already recorded
     existing_links = get_existing_links(blogger_dir)
     print(f"  Existing links recorded: {len(existing_links)}")
 
-    # Check if first run (no existing .md files)
     md_files = [f for f in os.listdir(blogger_dir) if f.endswith(".md")]
     is_first_run = len(md_files) == 0
 
@@ -382,7 +405,6 @@ def process_blogger(blogger):
         print(f"  First run: saving only the latest 1 post")
         posts_to_save = [posts[0]] if posts else []
     else:
-        # Find new posts by link comparison
         posts_to_save = []
         for post in posts:
             if post["link"] not in existing_links:
@@ -393,7 +415,6 @@ def process_blogger(blogger):
         print(f"  No new posts for {blogger['name']} - skipping")
         return False
 
-    # Generate markdown content
     now_dt = datetime.now()
     now_str = now_dt.strftime("%Y-%m-%d_%H-%M")
     now_full = now_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -404,7 +425,7 @@ def process_blogger(blogger):
     md_content += f"| 微博主页 | {blogger['url']} |\n"
     md_content += f"| 抓取时间 | {now_full} |\n"
     md_content += f"| 本次抓取条数 | {len(posts_to_save)} |\n"
-    md_content += f"| 数据来源 | m.weibo.cn API |\n\n---\n\n"
+    md_content += f"| 数据来源 | weibo.com Ajax API |\n\n---\n\n"
 
     for i, post in enumerate(posts_to_save, 1):
         title = post["title"] or "无标题"
@@ -419,9 +440,8 @@ def process_blogger(blogger):
         md_content += f"**正文**:\n\n{content_text}\n\n"
         md_content += f"---\n\n"
 
-    md_content += f"\n> 数据来源: m.weibo.cn API\n"
+    md_content += f"\n> 数据来源: weibo.com Ajax API\n"
 
-    # Save file
     filename = f"{now_str}.md"
     filepath = os.path.join(blogger_dir, filename)
 
@@ -442,6 +462,9 @@ def main():
     print(f"  Weibo Monitor - Started at {now_str}")
     if WEIBO_COOKIE:
         print(f"  Cookie: configured ({len(WEIBO_COOKIE)} chars)")
+        # Check for key cookie fields
+        has_sub = "SUB=" in WEIBO_COOKIE or "SUBP=" in WEIBO_COOKIE
+        print(f"  Cookie has SUB/SUBP: {has_sub}")
     else:
         print(f"  ⚠ No WEIBO_COOKIE set! API will likely fail.")
     print(f"{'=' * 60}")
