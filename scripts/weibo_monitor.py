@@ -105,6 +105,12 @@ def fetch_weibo_posts(uid):
 
             html = resp.text
 
+            # Debug: print response URL and first 500 chars
+            print(f"  Response URL: {resp.url}")
+            print(f"  Page size: {len(html)} bytes")
+            if len(html) < 5000:
+                print(f"  Page content (first 500 chars): {html[:500]}")
+
             # Check if we got redirected to a login page
             if "登录" in html and "密码" in html and len(html) < 5000:
                 print(f"  ⚠ Redirected to login page")
