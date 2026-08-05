@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Weibo Monitor - Fetches latest posts from Weibo bloggers via m.weibo.cn API.
+Weibo Monitor - Fetches latest posts from Weibo bloggers via RSSHub.
 Designed to run on GitHub Actions every 10 minutes.
+Uses a self-hosted RSSHub Docker instance (localhost:1200) with public fallbacks.
 
 First run: saves the latest 1 post per blogger.
 Subsequent runs: saves only new posts (detected by link comparison).
@@ -12,14 +13,14 @@ import os
 import re
 import sys
 import time
-import json
 from datetime import datetime
 from html import unescape
 
 import requests
+import feedparser
 
 # ============================================================
-# Bloggers — only need UID
+# Bloggers — only need UID, RSS URL is built from instances
 # ============================================================
 BLOGGERS = [
     {
@@ -36,13 +37,18 @@ BLOGGERS = [
     },
 ]
 
-# Request headers to mimic a mobile browser
+# RSSHub instances in fallback order (self-hosted first)
+RSSHUB_INSTANCES = [
+    "http://localhost:1200",
+    "https://rsshub.app",
+    "https://rsshub.rssforever.com",
+    "https://rsshub.pseudoyu.com",
+]
+
+# Request headers to mimic a normal browser
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    "Accept": "application/json, text/plain, */*",
-    "Referer": "https://m.weibo.cn/",
-    "MWeibo-Pwa": "1",
-    "X-Requested-With": "XMLHttpRequest",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
 
 
@@ -79,172 +85,54 @@ def get_existing_links(blogger_dir):
     return links
 
 
-def get_visitor_cookie():
-    """Visit m.weibo.cn to get a visitor cookie (_T_WM)."""
-    try:
-        session = requests.Session()
-        session.headers.update(HEADERS)
-        # Visit the main page first to get cookies
-        resp = session.get("https://m.weibo.cn/", timeout=15)
-        cookies = session.cookies.get_dict()
-        if cookies:
-            print(f"  Got visitor cookies: {list(cookies.keys())}")
-        return session
-    except Exception as e:
-        print(f"  ⚠ Failed to get visitor cookie: {e}")
-        return requests.Session()
-
-
-def fetch_weibo_posts(uid):
-    """Fetch latest posts from m.weibo.cn API.
-
-    Returns a list of dicts with keys: title, link, description, published.
-    Returns None on failure.
-    """
-    url = "https://m.weibo.cn/api/container/getIndex"
-
-    # Get a session with visitor cookies
-    session = get_visitor_cookie()
-    session.headers.update(HEADERS)
-
-    for attempt in range(3):
-        try:
-            if attempt > 0:
-                time.sleep(2 ** attempt)
-
-            params = {"type": "uid", "value": uid}
-            resp = session.get(url, params=params, timeout=30)
-
-            if resp.status_code != 200:
-                print(f"  ⚠ m.weibo.cn returned HTTP {resp.status_code}")
-                # Try refreshing cookies
-                session = get_visitor_cookie()
-                session.headers.update(HEADERS)
-                continue
-
-            data = resp.json()
-
-            if data.get("ok") != 1:
-                msg = data.get("msg", "unknown error")
-                print(f"  ⚠ m.weibo.cn API error: {msg} (attempt {attempt+1}/3)")
-                # Print response for debugging
-                print(f"  Response keys: {list(data.keys())}")
-                if "data" in data:
-                    print(f"  Data keys: {list(data['data'].keys()) if isinstance(data['data'], dict) else 'not dict'}")
-                # Try refreshing cookies
-                session = get_visitor_cookie()
-                session.headers.update(HEADERS)
-                continue
-
-            # Extract posts from cards
-            posts = []
-            cards = data.get("data", {}).get("cards", [])
-            for card in cards:
-                # card_type 9 = weibo post
-                if card.get("card_type") == 9:
-                    mblog = card.get("mblog", {})
-                    if not mblog:
-                        continue
-                    post = parse_mblog(mblog, uid)
-                    if post:
-                        posts.append(post)
-                # card_group may contain nested cards
-                elif card.get("card_group"):
-                    for sub_card in card["card_group"]:
-                        if sub_card.get("card_type") == 9:
-                            mblog = sub_card.get("mblog", {})
-                            if not mblog:
-                                continue
-                            post = parse_mblog(mblog, uid)
-                            if post:
-                                posts.append(post)
-
-            if posts:
-                return posts
-            else:
-                print(f"  No posts found in API response")
-                # Try to get the next page
-                return []
-
-        except requests.exceptions.RequestException as e:
-            print(f"  ⚠ m.weibo.cn request failed: {e}")
-        except json.JSONDecodeError as e:
-            print(f"  ⚠ m.weibo.cn response parse error: {e}")
-        except Exception as e:
-            print(f"  ⚠ Unexpected error: {e}")
-
+def fetch_rss(uid):
+    """Fetch RSS feed from RSSHub with fallback instances and retries."""
+    for instance in RSSHUB_INSTANCES:
+        rss_url = f"{instance}/weibo/user/{uid}"
+        for attempt in range(2):
+            try:
+                if attempt > 0:
+                    time.sleep(2)
+                resp = requests.get(rss_url, headers=HEADERS, timeout=30)
+                if resp.status_code == 200:
+                    feed = feedparser.parse(resp.text)
+                    if feed.entries:
+                        print(f"  ✓ {instance} returned {len(feed.entries)} entries")
+                        return feed
+                    else:
+                        print(f"  ⚠ {instance} returned 200 but no entries")
+                else:
+                    print(f"  ⚠ {instance} returned HTTP {resp.status_code}")
+            except requests.exceptions.RequestException as e:
+                # Don't print connection errors for localhost if it's not ready
+                if "localhost" in instance:
+                    print(f"  ⚠ {instance} not available")
+                else:
+                    print(f"  ⚠ {instance} failed: {type(e).__name__}")
+                break  # Network error, skip to next instance
+        print(f"  → Switching to next RSSHub instance...")
     return None
 
 
-def parse_mblog(mblog, uid):
-    """Parse an mblog object into a post dict."""
-    try:
-        bid = mblog.get("bid", "")
-        id_str = mblog.get("id", "")
-        # Build the weibo link
-        if id_str:
-            link = f"https://weibo.com/{uid}/{id_str}"
-        elif bid:
-            link = f"https://weibo.com/{uid}/{bid}"
-        else:
-            return None
-
-        # Get text content
-        raw_text = mblog.get("text", "")
-        text = strip_html(raw_text)
-
-        # Get title (if long post, use the title field)
-        title = mblog.get("page_title", "") or text[:50]
-
-        # Get created_at
-        created_at = mblog.get("created_at", "")
-
-        # Get long text if available (retweeted/long post)
-        long_text = mblog.get("longText", {}).get("longTextContent", "") if mblog.get("isLongText") else ""
-        if long_text:
-            text = strip_html(long_text)
-
-        # Get original post if retweet
-        retweeted_status = mblog.get("retweeted_status", {})
-        if retweeted_status:
-            retweet_text = strip_html(retweeted_status.get("text", ""))
-            retweet_user = retweeted_status.get("user", {}).get("screen_name", "")
-            text += f"\n\n🔁 转发 @{retweet_user}:\n{retweet_text}"
-
-        # Get images
-        pics = mblog.get("pics", [])
-        pic_urls = [p.get("large", {}).get("url", p.get("url", "")) for p in pics] if pics else []
-        if pic_urls:
-            text += "\n\n📷 图片:\n" + "\n".join(pic_urls)
-
-        return {
-            "title": title,
-            "link": link,
-            "description": text,
-            "published": created_at,
-        }
-    except Exception as e:
-        print(f"  ⚠ Error parsing mblog: {e}")
-        return None
-
-
 def process_blogger(blogger):
-    """Process a single blogger: fetch posts, detect new ones, save to file."""
+    """Process a single blogger: fetch RSS, detect new posts, save to file."""
     blogger_dir = blogger["dir"]
     os.makedirs(blogger_dir, exist_ok=True)
 
-    print(f"  Fetching posts for UID: {blogger['uid']}")
-    posts = fetch_weibo_posts(blogger["uid"])
+    print(f"  Fetching RSS for UID: {blogger['uid']}")
+    feed = fetch_rss(blogger["uid"])
 
-    if posts is None:
-        print(f"  Failed to fetch posts for {blogger['name']}")
+    if not feed:
+        print(f"  Failed to fetch feed for {blogger['name']}")
         return False
 
-    if not posts:
-        print(f"  No posts returned for {blogger['name']}")
+    if not feed.entries:
+        print(f"  No entries in feed for {blogger['name']}")
         return False
 
-    print(f"  Total posts fetched: {len(posts)}")
+    feed_title = feed.feed.get("title", blogger["name"])
+    print(f"  Feed title: {feed_title}")
+    print(f"  Total entries in feed: {len(feed.entries)}")
 
     # Get all links already recorded
     existing_links = get_existing_links(blogger_dir)
@@ -256,13 +144,14 @@ def process_blogger(blogger):
 
     if is_first_run:
         print(f"  First run: saving only the latest 1 post")
-        posts_to_save = [posts[0]] if posts else []
+        posts_to_save = [feed.entries[0]] if feed.entries else []
     else:
         # Find new posts by link comparison
         posts_to_save = []
-        for post in posts:
-            if post["link"] not in existing_links:
-                posts_to_save.append(post)
+        for entry in feed.entries:
+            link = entry.get("link", "")
+            if link and link not in existing_links:
+                posts_to_save.append(entry)
         print(f"  New posts found: {len(posts_to_save)}")
 
     if not posts_to_save:
@@ -280,13 +169,14 @@ def process_blogger(blogger):
     md_content += f"| 微博主页 | {blogger['url']} |\n"
     md_content += f"| 抓取时间 | {now_full} |\n"
     md_content += f"| 本次抓取条数 | {len(posts_to_save)} |\n"
-    md_content += f"| 数据来源 | m.weibo.cn API |\n\n---\n\n"
+    md_content += f"| 数据来源 | RSSHub |\n\n---\n\n"
 
-    for i, post in enumerate(posts_to_save, 1):
-        title = post["title"] or "无标题"
-        link = post["link"]
-        content_text = post["description"]
-        published = post["published"]
+    for i, entry in enumerate(posts_to_save, 1):
+        title = entry.get("title", "无标题")
+        link = entry.get("link", "")
+        description = entry.get("description", "") or entry.get("summary", "")
+        content_text = strip_html(description)
+        published = entry.get("published", entry.get("updated", ""))
 
         md_content += f"### {i}. {title}\n\n"
         md_content += f"**链接**: {link}\n\n"
@@ -295,7 +185,7 @@ def process_blogger(blogger):
         md_content += f"**正文**:\n\n{content_text}\n\n"
         md_content += f"---\n\n"
 
-    md_content += f"\n> 数据来源: m.weibo.cn API\n"
+    md_content += f"\n> 数据来源: RSSHub\n"
 
     # Save file
     filename = f"{now_str}.md"
