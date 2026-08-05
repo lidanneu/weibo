@@ -2,6 +2,7 @@
 """
 Weibo Monitor - Fetches latest posts from Weibo bloggers via m.weibo.cn API.
 Requires WEIBO_COOKIE environment variable (GitHub Actions secret).
+The cookie can be from weibo.com or m.weibo.cn — the script handles SSO cross-domain login.
 
 First run: saves the latest 1 post per blogger.
 Subsequent runs: saves only new posts (detected by link comparison).
@@ -82,24 +83,91 @@ def get_existing_links(blogger_dir):
     return links
 
 
+def create_session():
+    """Create a requests session with cookie set for multiple domains."""
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    if WEIBO_COOKIE:
+        # Parse cookie string and set cookies for multiple domains
+        for cookie_pair in WEIBO_COOKIE.split(";"):
+            cookie_pair = cookie_pair.strip()
+            if "=" in cookie_pair:
+                name, value = cookie_pair.split("=", 1)
+                name = name.strip()
+                value = value.strip()
+                # Set for all weibo-related domains
+                for domain in [".weibo.cn", ".weibo.com", ".sina.com.cn", ".sina.cn"]:
+                    session.cookies.set(name, value, domain=domain)
+
+        # Also set as header for maximum compatibility
+        session.headers["Cookie"] = WEIBO_COOKIE
+
+    return session
+
+
+def do_sso_login(session):
+    """Perform SSO cross-domain login to get m.weibo.cn cookies from weibo.com cookies."""
+    # Step 1: Visit m.weibo.cn to trigger SSO redirect
+    try:
+        resp = session.get("https://m.weibo.cn/", timeout=15, allow_redirects=False)
+    except Exception as e:
+        print(f"  SSO step 1 failed: {e}")
+        return False
+
+    # Step 2: If redirected to SSO, follow the redirect chain
+    sso_url = None
+    if resp.status_code in (301, 302):
+        sso_url = resp.headers.get("Location", "")
+    else:
+        # Try API call to detect SSO redirect
+        try:
+            api_url = "https://m.weibo.cn/api/config"
+            resp2 = session.get(api_url, timeout=15)
+            if resp2.status_code == 200:
+                data = resp2.json()
+                if data.get("ok") == -100:
+                    sso_url = data.get("url", "")
+        except Exception:
+            pass
+
+    if not sso_url:
+        print("  No SSO redirect detected, cookies may already be valid")
+        return True
+
+    print(f"  SSO login: following redirect...")
+
+    # Follow SSO redirect chain (passport.weibo.com → m.weibo.cn)
+    try:
+        current_url = sso_url
+        for _ in range(5):  # Max 5 redirects
+            if not current_url:
+                break
+            resp = session.get(current_url, timeout=15, allow_redirects=False)
+            if resp.status_code in (301, 302):
+                current_url = resp.headers.get("Location", "")
+                if current_url and not current_url.startswith("http"):
+                    # Relative URL
+                    current_url = "https://m.weibo.cn" + current_url
+            else:
+                break
+        print("  SSO login completed")
+        return True
+    except Exception as e:
+        print(f"  SSO follow failed: {e}")
+        return False
+
+
 def fetch_weibo_posts(uid):
     """Fetch latest posts from m.weibo.cn API using cookie authentication.
 
     Returns a list of dicts with keys: title, link, description, published.
     Returns None on failure.
     """
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    session = create_session()
 
-    # Set cookie
-    if WEIBO_COOKIE:
-        session.headers["Cookie"] = WEIBO_COOKIE
-
-    # First visit m.weibo.cn to establish session
-    try:
-        session.get("https://m.weibo.cn/", timeout=15)
-    except Exception:
-        pass
+    # Perform SSO cross-domain login if needed
+    do_sso_login(session)
 
     url = "https://m.weibo.cn/api/container/getIndex"
 
@@ -107,6 +175,10 @@ def fetch_weibo_posts(uid):
         try:
             if attempt > 0:
                 time.sleep(3)
+                # Re-do SSO login on retry
+                if attempt == 1:
+                    print("  Retrying with SSO login...")
+                    do_sso_login(session)
 
             # Step 1: Get the containerid for the user
             params1 = {"type": "uid", "value": uid}
@@ -121,6 +193,23 @@ def fetch_weibo_posts(uid):
             if data1.get("ok") != 1:
                 msg = data1.get("msg", "unknown error")
                 print(f"  ⚠ API error (attempt {attempt+1}/3): {msg}")
+                if "url" in data1:
+                    print(f"  SSO redirect detected, following...")
+                    sso_url = data1["url"]
+                    try:
+                        current_url = sso_url
+                        for _ in range(5):
+                            if not current_url:
+                                break
+                            resp = session.get(current_url, timeout=15, allow_redirects=False)
+                            if resp.status_code in (301, 302):
+                                current_url = resp.headers.get("Location", "")
+                                if current_url and not current_url.startswith("http"):
+                                    current_url = "https://m.weibo.cn" + current_url
+                            else:
+                                break
+                    except Exception:
+                        pass
                 if attempt == 2:
                     print(f"  Response: {json.dumps(data1, ensure_ascii=False)[:300]}")
                 continue
