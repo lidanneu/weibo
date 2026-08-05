@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Weibo Monitor - Fetches latest posts from Weibo bloggers via weibo.cn WAP page.
-Designed to run on GitHub Actions every 10 minutes.
+Weibo Monitor - Fetches latest posts from Weibo bloggers via m.weibo.cn API.
+Requires WEIBO_COOKIE environment variable (GitHub Actions secret).
 
 First run: saves the latest 1 post per blogger.
 Subsequent runs: saves only new posts (detected by link comparison).
@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import time
+import json
 from datetime import datetime
 from html import unescape
 
@@ -35,12 +36,16 @@ BLOGGERS = [
     },
 ]
 
-# Mobile browser headers for weibo.cn
+# Get cookie from environment
+WEIBO_COOKIE = os.environ.get("WEIBO_COOKIE", "")
+
+# Request headers
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-CN,zh;q=0.9",
-    "Referer": "https://weibo.cn/",
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://m.weibo.cn/",
+    "MWeibo-Pwa": "1",
+    "X-Requested-With": "XMLHttpRequest",
 }
 
 
@@ -78,7 +83,7 @@ def get_existing_links(blogger_dir):
 
 
 def fetch_weibo_posts(uid):
-    """Fetch latest posts from weibo.cn WAP page.
+    """Fetch latest posts from m.weibo.cn API using cookie authentication.
 
     Returns a list of dicts with keys: title, link, description, published.
     Returns None on failure.
@@ -86,149 +91,176 @@ def fetch_weibo_posts(uid):
     session = requests.Session()
     session.headers.update(HEADERS)
 
+    # Set cookie
+    if WEIBO_COOKIE:
+        session.headers["Cookie"] = WEIBO_COOKIE
+
+    # First visit m.weibo.cn to establish session
+    try:
+        session.get("https://m.weibo.cn/", timeout=15)
+    except Exception:
+        pass
+
+    url = "https://m.weibo.cn/api/container/getIndex"
+
     for attempt in range(3):
         try:
             if attempt > 0:
                 time.sleep(3)
 
-            # First visit the homepage to get cookies
-            if attempt == 0:
-                session.get("https://weibo.cn/", timeout=15)
+            # Step 1: Get the containerid for the user
+            params1 = {"type": "uid", "value": uid}
+            resp1 = session.get(url, params=params1, timeout=30)
 
-            # Fetch the user's profile page
-            url = f"https://weibo.cn/{uid}"
-            resp = session.get(url, timeout=30)
-
-            if resp.status_code != 200:
-                print(f"  ⚠ weibo.cn returned HTTP {resp.status_code}")
+            if resp1.status_code != 200:
+                print(f"  ⚠ m.weibo.cn returned HTTP {resp1.status_code}")
                 continue
 
-            html = resp.text
+            data1 = resp1.json()
 
-            # Debug: print response URL and first 500 chars
-            print(f"  Response URL: {resp.url}")
-            print(f"  Page size: {len(html)} bytes")
-            if len(html) < 5000:
-                print(f"  Page content (first 500 chars): {html[:500]}")
-
-            # Check if we got redirected to a login page
-            if "登录" in html and "密码" in html and len(html) < 5000:
-                print(f"  ⚠ Redirected to login page")
+            if data1.get("ok") != 1:
+                msg = data1.get("msg", "unknown error")
+                print(f"  ⚠ API error (attempt {attempt+1}/3): {msg}")
+                if attempt == 2:
+                    print(f"  Response: {json.dumps(data1, ensure_ascii=False)[:300]}")
                 continue
 
-            posts = parse_weibo_cn_html(html, uid)
+            # Extract containerid from tabsInfo
+            tabs_info = data1.get("data", {}).get("tabsInfo", {})
+            tabs = tabs_info.get("tabs", [])
+            container_id = None
+            for tab in tabs:
+                if tab.get("tab_type") == "weibo":
+                    container_id = tab.get("containerid")
+                    break
+
+            if not container_id:
+                # Fallback: try to get posts directly from the first response
+                posts = extract_posts_from_cards(data1, uid)
+                if posts:
+                    print(f"  ✓ Got {len(posts)} posts (from profile page)")
+                    return posts
+                print(f"  ⚠ No containerid found")
+                continue
+
+            # Step 2: Fetch posts using the containerid
+            params2 = {"type": "uid", "value": uid, "containerid": container_id}
+            resp2 = session.get(url, params=params2, timeout=30)
+
+            if resp2.status_code != 200:
+                print(f"  ⚠ m.weibo.cn posts API returned HTTP {resp2.status_code}")
+                continue
+
+            data2 = resp2.json()
+
+            if data2.get("ok") != 1:
+                print(f"  ⚠ Posts API error: {data2.get('msg', 'unknown')}")
+                continue
+
+            posts = extract_posts_from_cards(data2, uid)
 
             if posts:
-                print(f"  ✓ Parsed {len(posts)} posts from weibo.cn")
+                print(f"  ✓ Got {len(posts)} posts")
                 return posts
             else:
-                print(f"  ⚠ No posts found in page (page size: {len(html)} bytes)")
-                # Try page 2 as well
-                resp2 = session.get(f"https://weibo.cn/{uid}?page=2", timeout=30)
-                if resp2.status_code == 200:
-                    posts2 = parse_weibo_cn_html(resp2.text, uid)
-                    if posts2:
-                        print(f"  ✓ Parsed {len(posts2)} posts from page 2")
-                        return posts2
-                continue
+                print(f"  ⚠ No posts in response")
+                # Try page 2
+                params3 = {"type": "uid", "value": uid, "containerid": container_id, "page": 2}
+                resp3 = session.get(url, params=params3, timeout=30)
+                if resp3.status_code == 200:
+                    data3 = resp3.json()
+                    posts3 = extract_posts_from_cards(data3, uid)
+                    if posts3:
+                        print(f"  ✓ Got {len(posts3)} posts (page 2)")
+                        return posts3
 
         except requests.exceptions.RequestException as e:
-            print(f"  ⚠ weibo.cn request failed: {type(e).__name__}: {e}")
+            print(f"  ⚠ Request failed: {type(e).__name__}: {e}")
+        except json.JSONDecodeError as e:
+            print(f"  ⚠ JSON parse error: {e}")
         except Exception as e:
-            print(f"  ⚠ Unexpected error: {type(e).__name__}: {e}")
+            print(f"  ⚠ Error: {type(e).__name__}: {e}")
 
     return None
 
 
-def parse_weibo_cn_html(html, uid):
-    """Parse weibo.cn HTML page to extract posts.
-
-    weibo.cn uses simple HTML with divs containing post content.
-    Each post has a link like /{uid}/{post_id}
-    """
+def extract_posts_from_cards(data, uid):
+    """Extract posts from API response cards."""
     posts = []
+    cards = data.get("data", {}).get("cards", [])
 
-    # Find all post links - format: /{uid}/{post_id} (without /u/)
-    # Also try the pattern href="/uid/postid"
-    post_pattern = rf'href="https?://weibo\.cn/{uid}/(\w+)"'
-    post_ids = re.findall(post_pattern, html)
-
-    if not post_ids:
-        # Try alternative pattern: href="/uid/postid"
-        post_pattern2 = rf'href="/{uid}/(\w+)"'
-        post_ids = re.findall(post_pattern2, html)
-
-    if not post_ids:
-        # Try weibo.com pattern
-        post_pattern3 = rf'href="https?://weibo\.com/{uid}/(\w+)"'
-        post_ids = re.findall(post_pattern3, html)
-
-    # Deduplicate while preserving order
-    seen_ids = set()
-    unique_post_ids = []
-    for pid in post_ids:
-        if pid not in seen_ids and pid != uid:
-            seen_ids.add(pid)
-            unique_post_ids.append(pid)
-
-    # Extract post content blocks
-    # weibo.cn posts are in <div class="c"> elements
-    # Each post block contains the text and a link to the post
-    div_blocks = re.findall(r'<div class="c"[^>]*>(.*?)</div>', html, re.DOTALL)
-
-    for post_id in unique_post_ids[:10]:  # Limit to 10 posts
-        link = f"https://weibo.com/{uid}/{post_id}"
-
-        # Try to find the content for this post
-        content = ""
-
-        # Search for the post_id in div blocks to find the right block
-        for block in div_blocks:
-            if post_id in block:
-                # Extract text content - remove HTML tags
-                # Remove link tags first
-                block = re.sub(r'<a[^>]*>.*?</a>', '', block, flags=re.DOTALL)
-                # Remove spans with style (usually timestamps or metadata)
-                block = re.sub(r'<span[^>]*class="[^"]*ct[^"]*"[^>]*>.*?</span>', '', block, flags=re.DOTALL)
-                content = strip_html(block)
-                break
-
-        if not content:
-            # Fallback: try to extract any text near the post_id
-            # Look for text before the link
-            pattern = rf'(.*?)href="[^"]*{post_id}"'
-            match = re.search(pattern, html, re.DOTALL)
-            if match:
-                content = strip_html(match.group(1))
-            else:
-                content = "(content not available)"
-
-        # Try to find the timestamp
-        published = ""
-        # Look for timestamp pattern near the post
-        time_pattern = rf'{post_id}.*?(\d{{4}}-\d{{2}}-\d{{2}}[\s\d:]+(?:来自[^\s<]+)?)'
-        time_match = re.search(time_pattern, html, re.DOTALL)
-        if time_match:
-            published = strip_html(time_match.group(1))
-
-        # Also try the simpler pattern: date string in the block
-        if not published:
-            date_pattern = r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)'
-            date_match = re.search(date_pattern, html)
-            if date_match:
-                published = date_match.group(1)
-
-        # Title = first 50 chars of content
-        title = content[:50] + ("..." if len(content) > 50 else "")
-
-        posts.append({
-            "title": title,
-            "link": link,
-            "description": content,
-            "published": published,
-        })
+    for card in cards:
+        # card_type 9 = weibo post
+        if card.get("card_type") == 9:
+            mblog = card.get("mblog", {})
+            if mblog:
+                post = parse_mblog(mblog, uid)
+                if post:
+                    posts.append(post)
+        # card_group may contain nested cards
+        elif card.get("card_group"):
+            for sub_card in card["card_group"]:
+                if sub_card.get("card_type") == 9:
+                    mblog = sub_card.get("mblog", {})
+                    if mblog:
+                        post = parse_mblog(mblog, uid)
+                        if post:
+                            posts.append(post)
 
     return posts
+
+
+def parse_mblog(mblog, uid):
+    """Parse an mblog object into a post dict."""
+    try:
+        id_str = mblog.get("id", "")
+        bid = mblog.get("bid", "")
+
+        if id_str:
+            link = f"https://weibo.com/{uid}/{id_str}"
+        elif bid:
+            link = f"https://weibo.com/{uid}/{bid}"
+        else:
+            return None
+
+        # Get text content
+        raw_text = mblog.get("text", "")
+        text = strip_html(raw_text)
+
+        # Get long text if available
+        if mblog.get("isLongText"):
+            long_text = mblog.get("longText", {}).get("longTextContent", "")
+            if long_text:
+                text = strip_html(long_text)
+
+        # Get original post if retweet
+        retweeted_status = mblog.get("retweeted_status", {})
+        if retweeted_status:
+            retweet_text = strip_html(retweeted_status.get("text", ""))
+            retweet_user = retweeted_status.get("user", {}).get("screen_name", "")
+            text += f"\n\n🔁 转发 @{retweet_user}:\n{retweet_text}"
+
+        # Get images
+        pics = mblog.get("pics", [])
+        if pics:
+            pic_urls = [p.get("large", {}).get("url", p.get("url", "")) for p in pics]
+            text += "\n\n📷 图片:\n" + "\n".join(pic_urls)
+
+        # Get created_at
+        created_at = mblog.get("created_at", "")
+
+        # Title = first 50 chars
+        title = text[:50] + ("..." if len(text) > 50 else "")
+
+        return {
+            "title": title,
+            "link": link,
+            "description": text,
+            "published": created_at,
+        }
+    except Exception as e:
+        print(f"  ⚠ Error parsing mblog: {e}")
+        return None
 
 
 def process_blogger(blogger):
@@ -283,7 +315,7 @@ def process_blogger(blogger):
     md_content += f"| 微博主页 | {blogger['url']} |\n"
     md_content += f"| 抓取时间 | {now_full} |\n"
     md_content += f"| 本次抓取条数 | {len(posts_to_save)} |\n"
-    md_content += f"| 数据来源 | weibo.cn |\n\n---\n\n"
+    md_content += f"| 数据来源 | m.weibo.cn API |\n\n---\n\n"
 
     for i, post in enumerate(posts_to_save, 1):
         title = post["title"] or "无标题"
@@ -298,7 +330,7 @@ def process_blogger(blogger):
         md_content += f"**正文**:\n\n{content_text}\n\n"
         md_content += f"---\n\n"
 
-    md_content += f"\n> 数据来源: weibo.cn\n"
+    md_content += f"\n> 数据来源: m.weibo.cn API\n"
 
     # Save file
     filename = f"{now_str}.md"
@@ -319,6 +351,10 @@ def main():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{'=' * 60}")
     print(f"  Weibo Monitor - Started at {now_str}")
+    if WEIBO_COOKIE:
+        print(f"  Cookie: configured ({len(WEIBO_COOKIE)} chars)")
+    else:
+        print(f"  ⚠ No WEIBO_COOKIE set! API will likely fail.")
     print(f"{'=' * 60}")
 
     any_saved = False
