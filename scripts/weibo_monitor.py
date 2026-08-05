@@ -83,8 +83,19 @@ def get_existing_links(blogger_dir):
     return links
 
 
+def get_xsrf_token():
+    """Extract XSRF-TOKEN from cookie string."""
+    if not WEIBO_COOKIE:
+        return None
+    for part in WEIBO_COOKIE.split(";"):
+        part = part.strip()
+        if part.startswith("XSRF-TOKEN="):
+            return part.split("=", 1)[1]
+    return None
+
+
 def create_session():
-    """Create a requests session with cookie set for weibo.com."""
+    """Create a requests session with cookie and XSRF token set."""
     session = requests.Session()
     session.headers.update(HEADERS)
 
@@ -92,13 +103,19 @@ def create_session():
         # Set cookie as header
         session.headers["Cookie"] = WEIBO_COOKIE
 
-        # Also parse into cookie jar for proper domain handling
+        # Parse into cookie jar
         for cookie_pair in WEIBO_COOKIE.split(";"):
             cookie_pair = cookie_pair.strip()
             if "=" in cookie_pair:
                 name, value = cookie_pair.split("=", 1)
                 session.cookies.set(name.strip(), value.strip(), domain=".weibo.com")
                 session.cookies.set(name.strip(), value.strip(), domain=".sina.com.cn")
+
+        # Set XSRF-TOKEN header (required by weibo.com API)
+        xsrf = get_xsrf_token()
+        if xsrf:
+            session.headers["X-XSRF-TOKEN"] = xsrf
+            print(f"  XSRF-TOKEN: found ({len(xsrf)} chars)")
 
     return session
 
@@ -111,72 +128,77 @@ def fetch_weibo_posts(uid):
     """
     session = create_session()
 
-    # Step 0: Visit weibo.com to establish session and get any needed tokens
+    # Visit the user's profile page first (needed to get proper tokens)
     try:
-        session.get(f"https://weibo.com/u/{uid}", timeout=15, allow_redirects=True)
+        profile_url = f"https://weibo.com/u/{uid}"
+        session.get(profile_url, timeout=15, allow_redirects=True)
     except Exception:
         pass
 
-    # Try weibo.com Ajax API: profile profilePage
-    url = "https://weibo.com/ajax/statuses/profileProfilePage"
+    # Try multiple API endpoints
+    endpoints = [
+        # Format: (url, params_dict, description)
+        ("https://weibo.com/ajax/statuses/profileProfilePage",
+         {"uid": uid, "page": 1, "feature": 0},
+         "profileProfilePage"),
+        ("https://weibo.com/ajax/profile/mystimeline",
+         {"uid": uid, "page": 1, "feature": 0},
+         "mystimeline"),
+        ("https://weibo.com/ajax/profile/getcontent",
+         {"uid": uid, "page": 1},
+         "getcontent"),
+    ]
 
-    for attempt in range(3):
-        try:
-            if attempt > 0:
-                time.sleep(3)
+    for api_url, params, desc in endpoints:
+        print(f"  Trying {desc}...")
+        for attempt in range(2):
+            try:
+                if attempt > 0:
+                    time.sleep(2)
 
-            params = {
-                "uid": uid,
-                "page": 1,
-                "feature": 0,
-            }
+                resp = session.get(api_url, params=params, timeout=30)
 
-            resp = session.get(url, params=params, timeout=30)
+                if resp.status_code != 200:
+                    print(f"  ⚠ HTTP {resp.status_code}")
+                    continue
 
-            if resp.status_code != 200:
-                print(f"  ⚠ weibo.com returned HTTP {resp.status_code}")
-                if attempt == 2:
-                    print(f"  Response: {resp.text[:300]}")
-                continue
+                data = resp.json()
 
-            data = resp.json()
+                # Check for error response
+                if isinstance(data, dict) and (data.get("ok") == 0 or "error" in str(data.get("error", ""))):
+                    msg = data.get("message", "") or data.get("msg", "")
+                    print(f"  ⚠ API error: {msg}")
+                    continue
 
-            # Check for errors
-            if "error" in data or "error_code" in data:
-                err_msg = data.get("error", {}).get("message", "") or data.get("msg", "")
-                print(f"  ⚠ API error (attempt {attempt+1}/3): {err_msg}")
-                if attempt == 2:
-                    print(f"  Response: {json.dumps(data, ensure_ascii=False)[:300]}")
-                continue
+                # Try to extract posts
+                posts = extract_posts_from_weibo_com(data, uid)
 
-            # Extract posts from the response
-            posts = extract_posts_from_weibo_com(data, uid)
+                if posts:
+                    print(f"  ✓ Got {len(posts)} posts (via {desc})")
+                    return posts
+                else:
+                    print(f"  ⚠ No posts found (via {desc})")
+                    if attempt == 1:
+                        # Log response structure for debugging
+                        if isinstance(data, dict):
+                            print(f"  Response keys: {list(data.keys())}")
+                            if "data" in data and isinstance(data["data"], dict):
+                                print(f"  data keys: {list(data['data'].keys())}")
 
-            if posts:
-                print(f"  ✓ Got {len(posts)} posts")
-                return posts
-            else:
-                print(f"  ⚠ No posts in response (attempt {attempt+1}/3)")
-                if attempt == 2:
-                    print(f"  Response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
-                    print(f"  Response: {json.dumps(data, ensure_ascii=False)[:500]}")
+            except requests.exceptions.RequestException as e:
+                print(f"  ⚠ Request failed: {type(e).__name__}")
+            except json.JSONDecodeError:
+                print(f"  ⚠ Not JSON response")
+            except Exception as e:
+                print(f"  ⚠ Error: {type(e).__name__}: {e}")
 
-        except requests.exceptions.RequestException as e:
-            print(f"  ⚠ Request failed: {type(e).__name__}: {e}")
-        except json.JSONDecodeError as e:
-            print(f"  ⚠ JSON parse error: {e}")
-            if attempt == 2:
-                print(f"  Response text: {resp.text[:300]}")
-        except Exception as e:
-            print(f"  ⚠ Error: {type(e).__name__}: {e}")
-
-    # Fallback: try m.weibo.cn API
+    # Fallback: try m.weibo.cn API with SSO
     print("  Trying m.weibo.cn API as fallback...")
     return fetch_weibo_posts_m(uid, session)
 
 
 def fetch_weibo_posts_m(uid, session):
-    """Fallback: try m.weibo.cn API."""
+    """Fallback: try m.weibo.cn API with SSO cross-domain login."""
     url = "https://m.weibo.cn/api/container/getIndex"
     m_headers = {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
@@ -191,14 +213,44 @@ def fetch_weibo_posts_m(uid, session):
             resp = session.get(url, params=params, headers=m_headers, timeout=30)
 
             if resp.status_code != 200:
-                print(f"  ⚠ m.weibo.cn returned HTTP {resp.status_code}")
+                print(f"  ⚠ m.weibo.cn HTTP {resp.status_code}")
                 continue
 
             data = resp.json()
 
             if data.get("ok") != 1:
-                print(f"  ⚠ m.weibo.cn error: {data.get('msg', 'unknown')}")
-                continue
+                # Try SSO redirect
+                sso_url = data.get("url", "")
+                if sso_url:
+                    print(f"  SSO redirect, following...")
+                    try:
+                        # Follow SSO redirect chain
+                        current_url = sso_url
+                        for _ in range(5):
+                            if not current_url:
+                                break
+                            r = session.get(current_url, headers=m_headers, timeout=15, allow_redirects=False)
+                            if r.status_code in (301, 302):
+                                current_url = r.headers.get("Location", "")
+                                if current_url and not current_url.startswith("http"):
+                                    current_url = "https://m.weibo.cn" + current_url
+                            else:
+                                # Check if response has callback for setting cookies
+                                break
+                        # Retry API call
+                        resp = session.get(url, params=params, headers=m_headers, timeout=30)
+                        data = resp.json()
+                        if data.get("ok") == 1:
+                            pass  # Success, continue
+                        else:
+                            print(f"  ⚠ SSO failed: {data.get('msg', 'unknown')}")
+                            continue
+                    except Exception as e:
+                        print(f"  ⚠ SSO error: {e}")
+                        continue
+                else:
+                    print(f"  ⚠ m.weibo.cn error: {data.get('msg', 'unknown')}")
+                    continue
 
             # Extract containerid and fetch posts
             tabs_info = data.get("data", {}).get("tabsInfo", {})
@@ -236,13 +288,20 @@ def extract_posts_from_weibo_com(data, uid):
     """Extract posts from weibo.com Ajax API response."""
     posts = []
 
-    # weibo.com profileProfilePage response structure
+    # Try multiple response structures
     list_data = data.get("data", {}).get("list", [])
     if not list_data:
-        # Try alternate structure
         list_data = data.get("data", {}).get("statuses", [])
     if not list_data:
         list_data = data.get("statuses", [])
+    if not list_data:
+        list_data = data.get("data", {}).get("data", {}).get("list", [])
+    if not list_data:
+        # Maybe the data IS the list
+        if isinstance(data, list):
+            list_data = data
+        elif isinstance(data.get("data"), list):
+            list_data = data["data"]
 
     for item in list_data:
         post = parse_weibo_com_post(item, uid)
@@ -257,11 +316,14 @@ def parse_weibo_com_post(item, uid):
     try:
         id_str = str(item.get("id", ""))
         bid = item.get("bid", "")
+        mid = item.get("mid", "")
 
         if id_str:
             link = f"https://weibo.com/{uid}/{id_str}"
         elif bid:
             link = f"https://weibo.com/{uid}/{bid}"
+        elif mid:
+            link = f"https://weibo.com/{uid}/{mid}"
         else:
             return None
 
@@ -271,9 +333,13 @@ def parse_weibo_com_post(item, uid):
 
         # Get long text if available
         if item.get("isLongText"):
-            long_text = item.get("longText", {}).get("longTextContent", "")
-            if long_text:
-                text = strip_html(long_text)
+            long_text_content = ""
+            if isinstance(item.get("longText"), dict):
+                long_text_content = item["longText"].get("longTextContent", "")
+            elif isinstance(item.get("longTextContent"), str):
+                long_text_content = item["longTextContent"]
+            if long_text_content:
+                text = strip_html(long_text_content)
 
         # Get original post if retweet
         retweeted = item.get("retweeted_status", {})
@@ -292,8 +358,6 @@ def parse_weibo_com_post(item, uid):
 
         # Get created_at
         created_at = item.get("created_at", "")
-
-        # Title = first 50 chars
         title = text[:50] + ("..." if len(text) > 50 else "")
 
         return {
@@ -462,9 +526,10 @@ def main():
     print(f"  Weibo Monitor - Started at {now_str}")
     if WEIBO_COOKIE:
         print(f"  Cookie: configured ({len(WEIBO_COOKIE)} chars)")
-        # Check for key cookie fields
         has_sub = "SUB=" in WEIBO_COOKIE or "SUBP=" in WEIBO_COOKIE
         print(f"  Cookie has SUB/SUBP: {has_sub}")
+        has_xsrf = "XSRF-TOKEN=" in WEIBO_COOKIE
+        print(f"  Cookie has XSRF-TOKEN: {has_xsrf}")
     else:
         print(f"  ⚠ No WEIBO_COOKIE set! API will likely fail.")
     print(f"{'=' * 60}")
