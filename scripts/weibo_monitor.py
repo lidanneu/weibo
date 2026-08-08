@@ -160,7 +160,7 @@ def do_sso_login():
     return session
 
 
-def fetch_post_full_text(post_id, session):
+def fetch_post_full_text(post_id, session, list_len=0):
     """Fetch the FULL text of a single post via m.weibo.cn statuses/extend API.
 
     The list API returns truncated text (~140 chars). This endpoint returns
@@ -178,7 +178,14 @@ def fetch_post_full_text(post_id, session):
             return None
         long_text = data.get("data", {}).get("longTextContent", "")
         if long_text:
-            return strip_html(long_text)
+            full = strip_html(long_text)
+            if list_len:
+                print(f"    ✓ Full text: {len(full)} chars (vs list: {list_len} chars)")
+            else:
+                print(f"    ✓ Full text: {len(full)} chars")
+            return full
+        else:
+            print(f"    ⚠ extend API returned ok but no longTextContent")
     except Exception as e:
         print(f"    ⚠ Full text fetch error for {post_id}: {e}")
     return None
@@ -345,7 +352,8 @@ def enrich_post_full_text(post, session):
         return
 
     # Fetch full text for the main post
-    full = fetch_post_full_text(post["_id"], session)
+    cur_len = len(post.get("description", ""))
+    full = fetch_post_full_text(post["_id"], session, list_len=cur_len)
     if full:
         post["description"] = full
         post["title"] = full[:50] + ("..." if len(full) > 50 else "")
