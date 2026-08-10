@@ -185,19 +185,19 @@ def do_sso_login():
 
 def _attach_xsrf(session):
     """m.weibo.cn getIndex requires an X-XSRF-TOKEN header matching the
-    XSRF-TOKEN cookie, otherwise it returns 403 '请求被拒绝'. Pull the token
-    from the jar (set during SSO) and attach it as a header."""
+    XSRF-TOKEN cookie, otherwise it returns 403 '请求被拒绝'. The SSO response
+    sets XSRF-TOKEN twice (first = 'deleted', then the real one), so we must
+    take the LAST non-deleted value."""
     try:
         xsrf = None
         for c in session.cookies:
-            if c.name == "XSRF-TOKEN" and c.domain.endswith("weibo.cn"):
+            if c.name == "XSRF-TOKEN" and c.domain.endswith("weibo.cn") and c.value != "deleted":
                 xsrf = c.value
-                break
         if xsrf:
             session.headers["X-XSRF-TOKEN"] = xsrf
             print(f"  Attached X-XSRF-TOKEN header (len={len(xsrf)})")
         else:
-            print("  ⚠ No XSRF-TOKEN (weibo.cn) in jar to attach")
+            print("  ⚠ No valid XSRF-TOKEN (weibo.cn) in jar to attach")
     except Exception as e:
         print(f"  ⚠ XSRF attach error: {e}")
 
