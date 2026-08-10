@@ -99,6 +99,7 @@ def do_sso_login():
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9",
         "Referer": "https://m.weibo.cn/",
+        "Origin": "https://m.weibo.cn",
         "X-Requested-With": "XMLHttpRequest",
     })
 
@@ -171,13 +172,30 @@ def do_sso_login():
             print(f"  SSO login check: login={login_status}")
             if login_status:
                 print(f"  SSO login SUCCESS! jar cookies: {sorted(session.cookies.keys())}")
+                _attach_xsrf(session)
                 return session
     except Exception as e:
         print(f"  SSO check error: {e}")
 
     # Step 3: Try the API directly - sometimes the SSO completes even if the check fails
     print("  SSO check failed, trying API directly...")
+    _attach_xsrf(session)
     return session
+
+
+def _attach_xsrf(session):
+    """m.weibo.cn getIndex requires an X-XSRF-TOKEN header matching the
+    XSRF-TOKEN cookie, otherwise it returns 403 '请求被拒绝'. Pull the token
+    from the jar (set during SSO) and attach it as a header."""
+    try:
+        xsrf = session.cookies.get("XSRF-TOKEN")
+        if xsrf:
+            session.headers["X-XSRF-TOKEN"] = xsrf
+            print(f"  Attached X-XSRF-TOKEN header (len={len(xsrf)})")
+        else:
+            print("  ⚠ No XSRF-TOKEN in jar to attach")
+    except Exception as e:
+        print(f"  ⚠ XSRF attach error: {e}")
 
 
 def fetch_post_full_text(post_id, session, list_len=0):
