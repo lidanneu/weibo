@@ -251,7 +251,7 @@ def enrich_post_full_text(post, session):
 
     # Also fetch full text for retweeted posts if needed
     mblog = post.get("_mblog", {})
-    retweeted = mblog.get("retweeted_status", {})
+    retweeted = mblog.get("retweeted_status") or {}
     if retweeted and retweeted.get("isLongText"):
         retweet_id = retweeted.get("id", "")
         if retweet_id:
@@ -268,7 +268,7 @@ def finalize_post_content(post):
     post.pop("_is_long", None)
 
     # Handle retweet
-    retweeted = mblog.get("retweeted_status", {})
+    retweeted = mblog.get("retweeted_status") or {}
     if retweeted:
         retweet_text = retweeted.get("_full_text", "")
         if not retweet_text:
