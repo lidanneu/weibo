@@ -40,12 +40,6 @@ BLOGGERS = [
         "url": "https://weibo.com/u/1002568141",
         "dir": "weibo_菩提树下那道光",
     },
-    {
-        "name": "岚skl",
-        "uid": "8018491606",
-        "url": "https://weibo.com/u/8018491606",
-        "dir": "weibo_岚skl",
-    },
 ]
 
 WEIBO_COOKIE = os.environ.get("WEIBO_COOKIE", "")
@@ -104,8 +98,23 @@ def do_sso_login():
         "User-Agent": MOBILE_UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9",
-        "Cookie": WEIBO_COOKIE,  # Send weibo.com cookie to all requests
+        "Referer": "https://m.weibo.cn/",
+        "X-Requested-With": "XMLHttpRequest",
     })
+
+    # IMPORTANT: inject the weibo.com cookie into the cookie JAR (not a hardcoded
+    # Cookie header). A hardcoded session header would override the jar and prevent
+    # the m.weibo.cn cookies set during SSO from ever being sent — which is exactly
+    # what caused getIndex to 403.
+    # Setting domain=.weibo.com makes requests send it to passport.weibo.com (SSO).
+    for item in WEIBO_COOKIE.split(";"):
+        item = item.strip()
+        if "=" in item:
+            k, v = item.split("=", 1)
+            try:
+                session.cookies.set(k.strip(), v.strip(), domain=".weibo.com")
+            except Exception:
+                pass
 
     # Step 1: Visit m.weibo.cn to trigger SSO
     try:
@@ -156,7 +165,7 @@ def do_sso_login():
             login_status = data.get("data", {}).get("login", False)
             print(f"  SSO login check: login={login_status}")
             if login_status:
-                print("  SSO login SUCCESS!")
+                print(f"  SSO login SUCCESS! jar cookies: {sorted(session.cookies.keys())}")
                 return session
     except Exception as e:
         print(f"  SSO check error: {e}")
@@ -213,7 +222,9 @@ def fetch_weibo_posts(uid, session):
             resp1 = session.get(url, params=params1, timeout=30)
 
             if resp1.status_code != 200:
-                print(f"  ⚠ HTTP {resp1.status_code}")
+                ck_names = sorted(session.cookies.keys())
+                body_snip = resp1.text[:200].replace("\n", " ")
+                print(f"  ⚠ HTTP {resp1.status_code} | jar cookies: {ck_names} | body: {body_snip}")
                 continue
 
             data1 = resp1.json()
