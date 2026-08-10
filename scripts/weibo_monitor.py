@@ -105,16 +105,16 @@ def do_sso_login():
 
     # m.weibo.cn does NOT issue its own SUB auth cookie — it relies on the
     # weibo.com SUB cookie being passed in the request. So we inject the
-    # weibo.com cookie into the jar for BOTH .weibo.com (passport SSO) and
-    # .weibo.cn (m.weibo.cn itself). Using the jar (not a hardcoded Cookie
-    # header) lets the SSO-set cookies merge correctly and keeps SUB present
-    # for the getIndex call, which is what was missing and caused 403/unknown.
+    # weibo.com cookie into the jar for the .weibo.cn domain ONLY (so it is
+    # sent to m.weibo.cn for both the SSO handshake and the getIndex call).
+    # Injecting it for .weibo.com too would create duplicate cookies of the same
+    # name, which makes the XSRF-TOKEN lookup ambiguous and can get the request
+    # rejected with 403.
     for item in WEIBO_COOKIE.split(";"):
         item = item.strip()
         if "=" in item:
             k, v = item.split("=", 1)
             try:
-                session.cookies.set(k.strip(), v.strip(), domain=".weibo.com")
                 session.cookies.set(k.strip(), v.strip(), domain=".weibo.cn")
             except Exception:
                 pass
@@ -188,12 +188,16 @@ def _attach_xsrf(session):
     XSRF-TOKEN cookie, otherwise it returns 403 '请求被拒绝'. Pull the token
     from the jar (set during SSO) and attach it as a header."""
     try:
-        xsrf = session.cookies.get("XSRF-TOKEN")
+        xsrf = None
+        for c in session.cookies:
+            if c.name == "XSRF-TOKEN" and c.domain.endswith("weibo.cn"):
+                xsrf = c.value
+                break
         if xsrf:
             session.headers["X-XSRF-TOKEN"] = xsrf
             print(f"  Attached X-XSRF-TOKEN header (len={len(xsrf)})")
         else:
-            print("  ⚠ No XSRF-TOKEN in jar to attach")
+            print("  ⚠ No XSRF-TOKEN (weibo.cn) in jar to attach")
     except Exception as e:
         print(f"  ⚠ XSRF attach error: {e}")
 
