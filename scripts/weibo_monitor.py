@@ -172,6 +172,7 @@ def do_sso_login():
             print(f"  SSO login check: login={login_status}")
             if login_status:
                 print(f"  SSO login SUCCESS! jar cookies: {sorted(session.cookies.keys())}")
+                _diagnose_cookie_expiry(session)
                 _attach_xsrf(session)
                 return session
     except Exception as e:
@@ -181,6 +182,32 @@ def do_sso_login():
     print("  SSO check failed, trying API directly...")
     _attach_xsrf(session)
     return session
+
+
+def _diagnose_cookie_expiry(session):
+    """Decode the ALF cookie (weibo login expiry, a Unix timestamp) to check
+    whether the cookie has expired — a common cause of getIndex 403 while
+    config still reports login=True."""
+    try:
+        import time as _time
+        alf = None
+        for c in session.cookies:
+            if c.name == "ALF" and c.domain.endswith("weibo.cn"):
+                alf = c.value
+                break
+        if not alf:
+            print("  ⚠ No ALF cookie found (cannot check expiry)")
+            return
+        try:
+            exp = int(alf)
+            now = int(_time.time())
+            delta = exp - now
+            state = "EXPIRED" if delta <= 0 else f"valid ({delta}s left)"
+            print(f"  ALF expiry={exp} now={now} → {state}")
+        except ValueError:
+            print(f"  ALF value not a timestamp: {alf[:20]}")
+    except Exception as e:
+        print(f"  ⚠ expiry diag error: {e}")
 
 
 def _attach_xsrf(session):
