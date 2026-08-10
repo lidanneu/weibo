@@ -40,6 +40,12 @@ BLOGGERS = [
         "url": "https://weibo.com/u/1002568141",
         "dir": "weibo_菩提树下那道光",
     },
+    {
+        "name": "岚skl",
+        "uid": "8018491606",
+        "url": "https://weibo.com/u/8018491606",
+        "dir": "weibo_岚skl",
+    },
 ]
 
 WEIBO_COOKIE = os.environ.get("WEIBO_COOKIE", "")
