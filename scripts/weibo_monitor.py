@@ -260,11 +260,40 @@ def fetch_post_full_text(post_id, session, list_len=0):
     return None
 
 
+def _probe_clean_cookie(uid, url):
+    """Diagnostic probe: call getIndex with only the original weibo.com cookie,
+    mimicking the Aug 8 working setup, to see if the 403 is cookie-mixing or WAF."""
+    try:
+        p = requests.Session()
+        p.headers.update({
+            "User-Agent": MOBILE_UA,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Referer": "https://m.weibo.cn/",
+            "X-Requested-With": "XMLHttpRequest",
+            "Cookie": WEIBO_COOKIE,
+        })
+        r = p.get(url, params={"type": "uid", "value": uid}, timeout=30)
+        ok = None
+        try:
+            ok = r.json().get("ok")
+        except Exception:
+            pass
+        print(f"  [PROBE clean cookie] HTTP {r.status_code} ok={ok} body={r.text[:120]}")
+    except Exception as e:
+        print(f"  [PROBE clean cookie] error: {e}")
+
+
 def fetch_weibo_posts(uid, session):
     """Fetch posts from m.weibo.cn API using an authenticated session.
     For long posts, also fetches full text via the statuses/extend API.
     """
     url = "https://m.weibo.cn/api/container/getIndex"
+
+    # PROBE: test getIndex with ONLY the clean weibo.com cookie (Aug 8 style),
+    # excluding the SSO-set m.weibo.cn cookies, to isolate whether the 403 is
+    # caused by cookie mixing or by a WAF on the endpoint itself.
+    _probe_clean_cookie(uid, url)
 
     for attempt in range(3):
         try:
