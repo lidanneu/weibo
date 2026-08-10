@@ -261,31 +261,57 @@ def fetch_post_full_text(post_id, session, list_len=0):
 
 
 def _probe_clean_cookie(uid, url):
-    """Diagnostic probe: test the m.weibo.cn HTML profile page, which is NOT
-    the JSON getIndex API and may not be WAF-blocked. If it contains post data
-    we can scrape it instead."""
+    """Diagnostic probe: test weibo.com desktop profile page + AJAX API using the
+    weibo.com cookie directly (no m.weibo.cn SSO). The WEIBO_COOKIE contains
+    weibo.com cookies, so weibo.com endpoints may work where m.weibo.cn is WAF'd."""
     try:
-        html_url = f"https://m.weibo.cn/u/{uid}"
-        r = session.get(html_url, timeout=30) if False else None
-        # Use a fresh session with the same auth approach
+        import re as _re
+        # 1) Desktop HTML profile page
         p = requests.Session()
         p.headers.update({
-            "User-Agent": MOBILE_UA,
+            "User-Agent": DESKTOP_UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9",
-            "Referer": "https://m.weibo.cn/",
+            "Referer": "https://weibo.com/",
             "Cookie": WEIBO_COOKIE,
         })
+        html_url = f"https://weibo.com/u/{uid}"
         r = p.get(html_url, timeout=30)
-        has_render = "$render_data" in r.text or "render_data" in r.text
-        has_weibo = "weibo" in r.text.lower()
-        print(f"  [PROBE html page] HTTP {r.status_code} len={len(r.text)} has_render_data={has_render} has_weibo={has_weibo}")
-        # Try to find a post link in the HTML
-        import re as _re
-        links = _re.findall(r"/status/(\d+)", r.text)
-        print(f"  [PROBE html page] status links found: {len(set(links))}")
+        has_render = "$render_data" in r.text
+        links = set(_re.findall(r"/status/(\d+)", r.text))
+        print(f"  [PROBE weibo.com html] HTTP {r.status_code} len={len(r.text)} has_render={has_render} status_links={len(links)}")
+
+        # 2) Desktop AJAX API (needs x-xsrf-token from cookie if present)
+        xsrf = None
+        for c in p.cookies:
+            if c.name.upper() == "XSRF-TOKEN":
+                xsrf = c.value
+        # Also try to extract xsrf from the WEIBO_COOKIE string directly
+        for part in WEIBO_COOKIE.split(";"):
+            part = part.strip()
+            if part.startswith("XSRF-TOKEN="):
+                xsrf = part.split("=", 1)[1]
+        aj = requests.Session()
+        aj.headers.update({
+            "User-Agent": DESKTOP_UA,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Referer": f"https://weibo.com/u/{uid}",
+            "X-Requested-With": "XMLHttpRequest",
+            "Cookie": WEIBO_COOKIE,
+        })
+        if xsrf:
+            aj.headers["x-xsrf-token"] = xsrf
+        api_url = f"https://weibo.com/ajax/statuses/mymblog?uid={uid}&page=1&feature=0"
+        r2 = aj.get(api_url, timeout=30)
+        ok = None
+        try:
+            ok = r2.json().get("ok")
+        except Exception:
+            pass
+        print(f"  [PROBE weibo.com ajax] HTTP {r2.status_code} ok={ok} xsrf={'yes' if xsrf else 'no'} body={r2.text[:120]}")
     except Exception as e:
-        print(f"  [PROBE html page] error: {e}")
+        print(f"  [PROBE weibo.com] error: {e}")
 
 
 def fetch_weibo_posts(uid, session):
