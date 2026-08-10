@@ -102,13 +102,21 @@ def do_sso_login():
         "X-Requested-With": "XMLHttpRequest",
     })
 
-    # We need the weibo.com cookie to reach BOTH m.weibo.cn (to trigger the SSO
-    # redirect) and passport.weibo.com (to validate). The simplest way is to send
-    # it via a Cookie header DURING the SSO handshake only. After SSO completes,
-    # m.weibo.cn has set its own session cookie in the jar — we then DELETE this
-    # header so getIndex sends the m.weibo.cn cookie from the jar (not the
-    # weibo.com one), which is what previously caused the 403.
-    session.headers["Cookie"] = WEIBO_COOKIE
+    # m.weibo.cn does NOT issue its own SUB auth cookie — it relies on the
+    # weibo.com SUB cookie being passed in the request. So we inject the
+    # weibo.com cookie into the jar for BOTH .weibo.com (passport SSO) and
+    # .weibo.cn (m.weibo.cn itself). Using the jar (not a hardcoded Cookie
+    # header) lets the SSO-set cookies merge correctly and keeps SUB present
+    # for the getIndex call, which is what was missing and caused 403/unknown.
+    for item in WEIBO_COOKIE.split(";"):
+        item = item.strip()
+        if "=" in item:
+            k, v = item.split("=", 1)
+            try:
+                session.cookies.set(k.strip(), v.strip(), domain=".weibo.com")
+                session.cookies.set(k.strip(), v.strip(), domain=".weibo.cn")
+            except Exception:
+                pass
 
     # Step 1: Visit m.weibo.cn to trigger SSO
     try:
@@ -163,16 +171,12 @@ def do_sso_login():
             print(f"  SSO login check: login={login_status}")
             if login_status:
                 print(f"  SSO login SUCCESS! jar cookies: {sorted(session.cookies.keys())}")
-                # Drop the hardcoded weibo.com cookie header so subsequent API
-                # calls use the m.weibo.cn session cookie from the jar.
-                session.headers.pop("Cookie", None)
                 return session
     except Exception as e:
         print(f"  SSO check error: {e}")
 
     # Step 3: Try the API directly - sometimes the SSO completes even if the check fails
     print("  SSO check failed, trying API directly...")
-    session.headers.pop("Cookie", None)
     return session
 
 
