@@ -273,14 +273,21 @@ def finalize_post_content(post):
         retweet_text = retweeted.get("_full_text", "")
         if not retweet_text:
             retweet_text = strip_html(retweeted.get("text", ""))
-        retweet_user = retweeted.get("user", {}).get("screen_name", "")
+        retweet_user = (retweeted.get("user") or {}).get("screen_name", "")
         text += f"\n\n🔁 转发 @{retweet_user}:\n{retweet_text}"
 
     # Handle images
-    pics = mblog.get("pics", [])
+    pics = mblog.get("pics") or []
     if pics:
-        pic_urls = [p.get("large", {}).get("url", p.get("url", "")) for p in pics]
-        text += "\n\n📷 图片:\n" + "\n".join(pic_urls)
+        urls = []
+        for p in pics:
+            large = (p.get("large") or {}).get("url") if isinstance(p, dict) else None
+            url = large or (p.get("url") if isinstance(p, dict) else None) or ""
+            if url:
+                urls.append(url)
+        pic_urls = [u for u in urls if u]
+        if pic_urls:
+            text += "\n\n📷 图片:\n" + "\n".join(pic_urls)
 
     post["description"] = text
     # Update title from potentially longer text
