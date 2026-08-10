@@ -38,13 +38,19 @@ jobs:
       - name: 提交并推送
         run: |
           TZ=Asia/Shanghai
+          NOW=$(date '+%Y-%m-%d %H:%M')
           git config user.name "weibo-monitor-bot"
           git config user.email "weibo-monitor-bot@users.noreply.github.com"
+
+          # 更新保活时间戳，防止 schedule 被 GitHub 挂起
+          echo "${NOW}" > .last_run
+
           git add .
+
           if git diff --staged --quiet; then
             echo "没有新博文，跳过提交"
           else
-            git commit -m "auto: weibo-monitor update [$(date '+%Y-%m-%d %H:%M')]"
+            git commit -m "auto: weibo-monitor update [${NOW}]"
             git pull --rebase origin main
             git push origin main
           fi
