@@ -261,27 +261,31 @@ def fetch_post_full_text(post_id, session, list_len=0):
 
 
 def _probe_clean_cookie(uid, url):
-    """Diagnostic probe: call getIndex with only the original weibo.com cookie,
-    mimicking the Aug 8 working setup, to see if the 403 is cookie-mixing or WAF."""
+    """Diagnostic probe: test the m.weibo.cn HTML profile page, which is NOT
+    the JSON getIndex API and may not be WAF-blocked. If it contains post data
+    we can scrape it instead."""
     try:
+        html_url = f"https://m.weibo.cn/u/{uid}"
+        r = session.get(html_url, timeout=30) if False else None
+        # Use a fresh session with the same auth approach
         p = requests.Session()
         p.headers.update({
             "User-Agent": MOBILE_UA,
-            "Accept": "application/json, text/plain, */*",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9",
             "Referer": "https://m.weibo.cn/",
-            "X-Requested-With": "XMLHttpRequest",
             "Cookie": WEIBO_COOKIE,
         })
-        r = p.get(url, params={"type": "uid", "value": uid}, timeout=30)
-        ok = None
-        try:
-            ok = r.json().get("ok")
-        except Exception:
-            pass
-        print(f"  [PROBE clean cookie] HTTP {r.status_code} ok={ok} body={r.text[:120]}")
+        r = p.get(html_url, timeout=30)
+        has_render = "$render_data" in r.text or "render_data" in r.text
+        has_weibo = "weibo" in r.text.lower()
+        print(f"  [PROBE html page] HTTP {r.status_code} len={len(r.text)} has_render_data={has_render} has_weibo={has_weibo}")
+        # Try to find a post link in the HTML
+        import re as _re
+        links = _re.findall(r"/status/(\d+)", r.text)
+        print(f"  [PROBE html page] status links found: {len(set(links))}")
     except Exception as e:
-        print(f"  [PROBE clean cookie] error: {e}")
+        print(f"  [PROBE html page] error: {e}")
 
 
 def fetch_weibo_posts(uid, session):
