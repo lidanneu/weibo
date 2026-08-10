@@ -102,24 +102,21 @@ def do_sso_login():
         "X-Requested-With": "XMLHttpRequest",
     })
 
-    # IMPORTANT: inject the weibo.com cookie into the cookie JAR (not a hardcoded
-    # Cookie header). A hardcoded session header would override the jar and prevent
-    # the m.weibo.cn cookies set during SSO from ever being sent — which is exactly
-    # what caused getIndex to 403.
-    # Setting domain=.weibo.com makes requests send it to passport.weibo.com (SSO).
-    for item in WEIBO_COOKIE.split(";"):
-        item = item.strip()
-        if "=" in item:
-            k, v = item.split("=", 1)
-            try:
-                session.cookies.set(k.strip(), v.strip(), domain=".weibo.com")
-            except Exception:
-                pass
+    # We need the weibo.com cookie to reach BOTH m.weibo.cn (to trigger the SSO
+    # redirect) and passport.weibo.com (to validate). The simplest way is to send
+    # it via a Cookie header DURING the SSO handshake only. After SSO completes,
+    # m.weibo.cn has set its own session cookie in the jar — we then DELETE this
+    # header so getIndex sends the m.weibo.cn cookie from the jar (not the
+    # weibo.com one), which is what previously caused the 403.
+    session.headers["Cookie"] = WEIBO_COOKIE
 
     # Step 1: Visit m.weibo.cn to trigger SSO
     try:
         resp = session.get("https://m.weibo.cn/", timeout=15, allow_redirects=False)
         print(f"  SSO step 1: m.weibo.cn/ → HTTP {resp.status_code}")
+        set_cookies = resp.headers.get("Set-Cookie", "")
+        print(f"  SSO step 1 Set-Cookie: {set_cookies[:200]}")
+        print(f"  SSO step 1 jar after: {sorted(session.cookies.keys())}")
 
         # If redirected, follow the chain
         if resp.status_code in (301, 302):
@@ -166,12 +163,16 @@ def do_sso_login():
             print(f"  SSO login check: login={login_status}")
             if login_status:
                 print(f"  SSO login SUCCESS! jar cookies: {sorted(session.cookies.keys())}")
+                # Drop the hardcoded weibo.com cookie header so subsequent API
+                # calls use the m.weibo.cn session cookie from the jar.
+                session.headers.pop("Cookie", None)
                 return session
     except Exception as e:
         print(f"  SSO check error: {e}")
 
     # Step 3: Try the API directly - sometimes the SSO completes even if the check fails
     print("  SSO check failed, trying API directly...")
+    session.headers.pop("Cookie", None)
     return session
 
 
