@@ -645,7 +645,7 @@ def process_blogger(blogger, session):
 
         print(f"  Failed to fetch posts for {blogger['name']}")
 
-        return False
+        return "failed"
 
 
 
@@ -653,7 +653,7 @@ def process_blogger(blogger, session):
 
         print(f"  No posts returned for {blogger['name']}")
 
-        return False
+        return "none"
 
 
 
@@ -697,7 +697,7 @@ def process_blogger(blogger, session):
 
         print(f"  No new posts - skipping")
 
-        return False
+        return "none"
 
 
 
@@ -759,7 +759,7 @@ def process_blogger(blogger, session):
 
         print(f"  Saved {len(posts_to_save)} posts to {filepath}")
 
-        return True
+        return "saved"
 
     except Exception as e:
 
@@ -820,9 +820,11 @@ def main():
 
         print(f"{'- ' * 30}")
 
-        if process_blogger(blogger, session):
-
+        r = process_blogger(blogger, session)
+        if r == "saved":
             any_saved = True
+        elif r == "failed":
+            any_failed = True
 
 
 
